@@ -37,7 +37,7 @@ pip install -r requirements.txt
 python src/media_downloader.py
 
 # Build executable (requires PyInstaller)
-pyinstaller --onefile --windowed --icon=resources/logo.ico src/media_downloader.py
+pyinstaller --onefile --noconsole --icon=resources/logo.ico --add-data="resources/logo.ico;resources" --add-data="../LICENSE.txt;." media_downloader.py
 
 Supported Platforms
 
