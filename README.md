@@ -14,7 +14,7 @@ A user-friendly GUI application for downloading videos and audio from various pl
 
 ## Download
 Ready-to-use Windows executable:  
-[Download Latest Release](https://github.com/yourusername/Media-Downloader-Pro/releases) *(you'll create this after uploading)*
+[Download Latest Release](https://github.com/xGohac/Media-Downloader-Pro/releases)
 
 ## Usage
 1. Paste URLs (one per line)
@@ -22,7 +22,7 @@ Ready-to-use Windows executable:
 3. Choose download folder
 4. Click "Download Now"
 
-![UI Demo](docs/usage.gif) *(optional - add a short screen recording later)*
+![UI Demo](docs/usage.gif)
 
 ## Requirements
 - Windows 10/11
