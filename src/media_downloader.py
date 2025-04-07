@@ -1,11 +1,16 @@
 """
 Media Downloader Pro - Main Application File
-
-Contains all GUI and download logic for the application.
+Optimized for fast startup with background FFmpeg check
 """
 
 import sys
 import os
+import platform
+import subprocess
+import urllib.request
+import zipfile
+import tempfile
+import shutil
 import yt_dlp
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -13,30 +18,125 @@ from PyQt5.QtWidgets import (
     QFileDialog, QMessageBox, QGroupBox,
     QComboBox, QCheckBox, QAction, QActionGroup, QScrollArea, QDialog
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTranslator, QLocale
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTranslator, QLocale, QTimer
 from PyQt5.QtGui import QFont, QIcon, QTextOption, QColor, QPalette
+
+class FFmpegManager(QThread):
+    """Handles FFmpeg installation and verification in background"""
+    status_changed = pyqtSignal(str, str)  # status, message
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.ffmpeg_path = None
+        self.install_status = "checking"
+        self.platform = platform.system().lower()
+        self.parent = parent
+    
+    def run(self):
+        """Run in background thread"""
+        self.find_ffmpeg()
+        
+    def find_ffmpeg(self):
+        """Try to find FFmpeg in system PATH or common locations"""
+        try:
+            # First quick check if ffmpeg is in PATH
+            ffmpeg_path = shutil.which("ffmpeg")
+            if ffmpeg_path:
+                self.ffmpeg_path = ffmpeg_path
+                self.install_status = "installed"
+                self.status_changed.emit("installed", "FFmpeg ready")
+                return True
+            
+            # More thorough check in background
+            if self.platform == "windows":
+                common_paths = [
+                    os.path.join(os.environ.get("ProgramFiles", ""), "FFmpeg", "bin", "ffmpeg.exe"),
+                    os.path.join(os.environ.get("ProgramFiles(x86)", ""), "FFmpeg", "bin", "ffmpeg.exe"),
+                    os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe")
+                ]
+            else:  # Linux/Mac
+                common_paths = [
+                    "/usr/local/bin/ffmpeg",
+                    "/usr/bin/ffmpeg",
+                    os.path.join(os.path.expanduser("~"), "bin", "ffmpeg")
+                ]
+            
+            for path in common_paths:
+                if os.path.exists(path):
+                    self.ffmpeg_path = path
+                    self.install_status = "installed"
+                    self.status_changed.emit("installed", "FFmpeg ready")
+                    return True
+            
+            # If not found, attempt download (Windows only)
+            if self.platform == "windows":
+                self.status_changed.emit("downloading", "Downloading FFmpeg...")
+                if self.download_ffmpeg():
+                    self.status_changed.emit("installed", "FFmpeg ready")
+                    return True
+            
+            self.install_status = "missing"
+            self.status_changed.emit("missing", "FFmpeg missing")
+            return False
+            
+        except Exception as e:
+            print(f"Error finding FFmpeg: {e}")
+            self.install_status = "missing"
+            self.status_changed.emit("missing", "FFmpeg check failed")
+            return False
+    
+    def download_ffmpeg(self):
+        """Download FFmpeg for Windows"""
+        try:
+            url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+            temp_dir = tempfile.mkdtemp()
+            archive_path = os.path.join(temp_dir, "ffmpeg.zip")
+            
+            # Download with progress feedback
+            def report_progress(block_num, block_size, total_size):
+                percent = min(int(block_num * block_size * 100 / total_size), 100)
+                self.status_changed.emit("downloading", f"Downloading FFmpeg... {percent}%")
+            
+            urllib.request.urlretrieve(url, archive_path, reporthook=report_progress)
+            
+            # Extract
+            extract_dir = os.path.join(os.getcwd(), "ffmpeg")
+            os.makedirs(extract_dir, exist_ok=True)
+            
+            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+            
+            # Find the binary
+            for root, dirs, files in os.walk(extract_dir):
+                if "ffmpeg.exe" in files:
+                    self.ffmpeg_path = os.path.join(root, "ffmpeg.exe")
+                    self.install_status = "installed"
+                    
+                    # Add to PATH for this session
+                    os.environ["PATH"] = os.path.dirname(self.ffmpeg_path) + os.pathsep + os.environ.get("PATH", "")
+                    
+                    shutil.rmtree(temp_dir)
+                    return True
+            
+            return False
+                
+        except Exception as e:
+            print(f"Error downloading FFmpeg: {e}")
+            return False
 
 class DownloadThread(QThread):
     """
     A QThread subclass that handles the actual downloading process in the background.
-    
-    Signals:
-        update_progress(int, str): Emits progress updates (percentage, status message)
-        finished(): Emitted when all downloads are complete
-    
-    Args:
-        urls (list): List of URLs to download
-        download_folder (str): Path to save downloaded files
-        format_type (str): Selected format (e.g., 'mp3_192', 'mp4_720')
     """
     update_progress = pyqtSignal(int, str)
     finished = pyqtSignal()
 
-    def __init__(self, urls, download_folder, format_type):
+    def __init__(self, urls, download_folder, format_type, ffmpeg_path):
         super().__init__()
         self.urls = urls
         self.download_folder = download_folder
         self.format_type = format_type
+        self.ffmpeg_path = ffmpeg_path
         self.is_running = True
         self.ydl = None
 
@@ -62,7 +162,6 @@ class DownloadThread(QThread):
 
     def progress_hook(self, d):
         if d['status'] == 'downloading':
-            # Extract percentage from string (e.g., "42.3%" -> 42)
             progress = d.get('_percent_str', '0%').replace('%', '')
             try:
                 progress_int = int(float(progress))
@@ -71,53 +170,42 @@ class DownloadThread(QThread):
                     self.tr("Downloading: %s") % d.get('filename', '')
                 )
             except (ValueError, TypeError):
-                pass # Skip if progress string is malformed
+                pass
 
     def build_ytdlp_options(self):
-        """
-        Constructs the options dictionary for yt-dlp based on selected format.
-        
-        Returns:
-            dict: Configuration options for yt-dlp
-            
-        The options include:
-        - Output template
-        - Format selection
-        - Audio extraction settings (for MP3)
-        - Video quality settings (for MP4)
-        - Various performance optimizations
-        """
         opts = {
             'quiet': True,
             'no_warnings': True,
             'outtmpl': os.path.join(self.download_folder, '%(title)s.%(ext)s'),
             'noplaylist': True,
             'ignoreerrors': True,
-            'concurrent_fragment_downloads': 8,
-            'throttledratelimit': 10000000,  # 10M
-            'buffersize': 16384,
-            'nopart': True,
-            'hls_use_mpegts': True,
+            'ffmpeg_location': self.ffmpeg_path if self.ffmpeg_path else None,
         }
 
         if self.format_type.startswith("mp3"):
             opts.update({
-                'extract_audio': True,
-                'format': 'bestaudio',
+                'format': 'bestaudio/best',
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
                     'preferredquality': '320' if self.format_type == "mp3_320" else '192',
-                }]
+                }],
+                'keepvideo': False,
             })
         elif self.format_type.startswith("mp4"):
+            height_map = {
+                'mp4_720': '720',
+                'mp4_1080': '1080',
+                'mp4_best': 'best'
+            }
+            height = height_map.get(self.format_type, 'best')
+            
+            if height == 'best':
+                opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+            else:
+                opts['format'] = f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best'
+            
             opts['merge_output_format'] = 'mp4'
-            if self.format_type == "mp4_720":
-                opts['format'] = 'bv*[height<=720]+ba/b[height<=720]'
-            elif self.format_type == "mp4_1080":
-                opts['format'] = 'bv*[height<=1080]+ba/b[height<=1080]'
-            elif self.format_type == "mp4_best":
-                opts['format'] = 'bv*+ba/b'
 
         return opts
 
@@ -136,7 +224,7 @@ class LicenseDialog(QDialog):
         self.setMinimumSize(700, 500)
         
         # Hauptlayout
-        layout = QVBoxLayout(self)  # Direkt an den Dialog gebunden
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
         
@@ -154,7 +242,7 @@ class LicenseDialog(QDialog):
         self.license_label.setTextFormat(Qt.PlainText)
         self.license_label.setWordWrap(True)
         self.license_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.license_label.setFont(QFont("Consolas", 10))  # Bessere Lesbarkeit
+        self.license_label.setFont(QFont("Consolas", 10))
         
         self.text_layout.addWidget(self.license_label)
         scroll.setWidget(self.text_container)
@@ -167,12 +255,10 @@ class LicenseDialog(QDialog):
         layout.addWidget(scroll)
         layout.addWidget(self.btn_ok, alignment=Qt.AlignRight)
         
-        # Initiale Ladung und Theme-Anwendung
         self.load_license_text()
         self.apply_theme(parent.dark_mode if parent else False)
 
     def load_license_text(self):
-        """Lade Lizenztext mit verbesserter Fehlerbehandlung"""
         try:
             base_path = os.path.dirname(sys.argv[0])
             license_path = os.path.join(base_path, "LICENSE.txt")
@@ -189,9 +275,7 @@ class LicenseDialog(QDialog):
             self.license_label.setText(f"Error loading license: {str(e)}")
 
     def apply_theme(self, dark_mode):
-        """Theme mit besserem Kontrast anwenden"""
         if dark_mode:
-            # Dark Mode Styling
             self.setStyleSheet("""
                 QDialog {
                     background-color: #2d2d2d;
@@ -218,7 +302,6 @@ class LicenseDialog(QDialog):
             """)
             self.text_container.setStyleSheet("background-color: #252525;")
         else:
-            # Light Mode Styling
             self.setStyleSheet("""
                 QDialog {
                     background-color: #ffffff;
@@ -260,6 +343,7 @@ class AboutDialog(QMessageBox):
             <li>{self.tr('Extract audio as MP3 with different bitrates')}</li>
             <li>{self.tr('Batch download from multiple URLs')}</li>
             <li>{self.tr('Progress tracking')}</li>
+            <li>{self.tr('Automatic FFmpeg integration')}</li>
         </ul>
         
         <p><b>{self.tr('Author')}:</b> Jörg Schröder</p>
@@ -270,7 +354,6 @@ class AboutDialog(QMessageBox):
         self.setText(about_text)
         self.setIcon(QMessageBox.Information)
         
-        # License-Button hinzufügen
         self.addButton(self.tr("View Full License"), QMessageBox.ActionRole)
         self.buttonClicked.connect(self.on_button_click)
         
@@ -282,7 +365,6 @@ class AboutDialog(QMessageBox):
             license_dialog.exec_()
 
     def apply_theme(self, dark_mode):
-        """Apply theme to about dialog"""
         if dark_mode:
             self.setStyleSheet("""
                 QMessageBox {
@@ -312,7 +394,7 @@ class YouTubeDownloaderApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.dark_mode = True
-        self.current_language = "en"  # Default language
+        self.current_language = "en"
         self.translator = QTranslator()
         
         self.setWindowTitle("Media Downloader Pro")
@@ -321,14 +403,50 @@ class YouTubeDownloaderApp(QMainWindow):
         self.download_thread = None
         self.show_log = False
         
+        # Initialize FFmpeg manager
+        self.ffmpeg_manager = FFmpegManager(self)
+        self.ffmpeg_manager.status_changed.connect(self.update_ffmpeg_status)
+        
+        # Start FFmpeg check in background after short delay
+        QTimer.singleShot(100, self.ffmpeg_manager.start)
+
         icon_path = os.path.join(os.path.dirname(__file__), "resources", "logo.ico")
-        self.setWindowIcon(QIcon(icon_path))
+        if not os.path.exists(icon_path):
+            icon_path = ""
+        if icon_path:
+            self.setWindowIcon(QIcon(icon_path))
+            
         self.init_ui()
         self.apply_dark_theme()
         self.load_language(self.current_language)
 
+    def update_ffmpeg_status(self, status, message):
+        """Update UI based on FFmpeg status (called from background thread)"""
+        color = QColor(255, 255, 255)
+        
+        if status == "checking":
+            color = QColor(200, 200, 0)
+        elif status == "downloading":
+            color = QColor(0, 0, 200)
+        elif status == "installed":
+            color = QColor(0, 200, 0)
+            self.download_btn.setEnabled(True)
+        elif status == "missing":
+            color = QColor(255, 0, 0)
+            self.download_btn.setEnabled(False)
+            self.log(self.tr("FFmpeg is required for audio conversion and video merging."), QColor(255, 165, 0))
+        
+        self.ffmpeg_status_label.setText(message)
+        self.ffmpeg_status_label.setStyleSheet(f"color: {color.name()};")
+        
+        if status == "missing" and "check failed" in message:
+            self.log(self.tr("FFmpeg check failed. Please install manually."), QColor(255, 0, 0))
+        
+        # Show additional info for errors
+        if status == "missing" and "check failed" in message:
+            self.log(self.tr("FFmpeg check failed. Please install manually."), QColor(255, 0, 0))
+
     def toggle_theme(self):
-        """Toggle between dark and light mode"""
         self.dark_mode = not self.dark_mode
         if self.dark_mode:
             self.apply_dark_theme()
@@ -338,14 +456,10 @@ class YouTubeDownloaderApp(QMainWindow):
         self.update()
 
     def load_language(self, lang_code):
-        """Load translation for selected language"""
         self.current_language = lang_code
-        
-        # Remove old translator
         QApplication.instance().removeTranslator(self.translator)
         
         if lang_code == "de":
-            # Create German translations manually since we don't have .qm files
             translations = {
                 "Media Downloader Pro": "Media Downloader Pro",
                 "Enter Video/Audio URLs": "Video/Audio URLs eingeben",
@@ -390,13 +504,21 @@ class YouTubeDownloaderApp(QMainWindow):
                 "Batch download from multiple URLs": 
                     "Mehrere URLs gleichzeitig herunterladen",
                 "Progress tracking": "Fortschrittsverfolgung",
+                "Automatic FFmpeg integration": "Automatische FFmpeg-Integration",
                 "Author": "Autor",
                 "License": "Lizenz",
-                "This software is open source and available on GitHub for further development":
-                    "Diese Software ist Open Source und auf GitHub für weitere Entwicklung verfügbar"
+                "Checking FFmpeg...": "Prüfe FFmpeg...",
+                "Downloading FFmpeg...": "Lade FFmpeg herunter...",
+                "FFmpeg ready": "FFmpeg bereit",
+                "FFmpeg missing": "FFmpeg fehlt",
+                "FFmpeg is required for audio conversion and video merging.": 
+                    "FFmpeg wird für Audio-Konvertierung und Video-Merging benötigt.",
+                "Please install FFmpeg or restart the application to attempt automatic download.": 
+                    "Bitte installieren Sie FFmpeg oder starten Sie die Anwendung neu für einen automatischen Download-Versuch.",
+                "Failed to download FFmpeg. Please install it manually.": 
+                    "FFmpeg konnte nicht heruntergeladen werden. Bitte manuell installieren."
             }
             
-            # Create a custom translator
             class GermanTranslator(QTranslator):
                 def translate(self, context, source, disambiguation=None, n=-1):
                     return translations.get(source, source)
@@ -443,6 +565,10 @@ class YouTubeDownloaderApp(QMainWindow):
         # Theme button
         self.update_theme_button_text()
 
+        # Update FFmpeg status text without changing status
+        current_text = self.ffmpeg_status_label.text()
+        self.ffmpeg_status_label.setText(self.tr(current_text))
+
     def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -450,17 +576,26 @@ class YouTubeDownloaderApp(QMainWindow):
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(10)
 
-        # Create menu bar
         self.create_menu_bar()
 
-        # Header with theme toggle button
+        # Header with FFmpeg status, title and theme toggle
         header_layout = QHBoxLayout()
+        
+        # FFmpeg status
+        ffmpeg_layout = QHBoxLayout()
+        ffmpeg_layout.setAlignment(Qt.AlignLeft)
+        self.ffmpeg_status_label = QLabel("Checking FFmpeg...")
+        self.ffmpeg_status_label.setFont(QFont("Arial", 9))
+        ffmpeg_layout.addWidget(self.ffmpeg_status_label)
+        header_layout.addLayout(ffmpeg_layout)
+        
+        # Title
         self.header = QLabel("Media Downloader Pro")
         self.header.setFont(QFont("Arial", 16, QFont.Bold))
-        header_layout.addWidget(self.header)
+        self.header.setAlignment(Qt.AlignCenter)
+        header_layout.addWidget(self.header, stretch=1)
         
-        # Theme toggle button - now with text instead of icon
-        header_layout.addStretch()
+        # Theme toggle
         self.theme_btn = QPushButton()
         self.theme_btn.setFixedSize(100, 30)
         self.update_theme_button_text()
@@ -474,6 +609,7 @@ class YouTubeDownloaderApp(QMainWindow):
         self.url_group = QGroupBox()
         url_layout = QVBoxLayout()
         self.url_edit = QTextEdit()
+        self.url_edit.setPlaceholderText(self.tr("Paste one URL per line..."))
         self.url_edit.setFont(QFont("Arial", 10))
         url_layout.addWidget(self.url_edit)
         self.url_group.setLayout(url_layout)
@@ -483,7 +619,6 @@ class YouTubeDownloaderApp(QMainWindow):
         self.format_group = QGroupBox()
         format_layout = QVBoxLayout()
         
-        # Quality selection dropdown
         self.format_combo = QComboBox()
         formats = [
             (self.tr("MP3 (192 kbps)"), "mp3_192"),
@@ -584,7 +719,6 @@ class YouTubeDownloaderApp(QMainWindow):
         self.url_edit.setLineWrapMode(QTextEdit.NoWrap)
 
     def update_theme_button_text(self):
-        """Update theme button text based on current mode"""
         if self.dark_mode:
             self.theme_btn.setText(self.tr("Light Mode"))
             self.theme_btn.setStyleSheet("""
@@ -611,7 +745,6 @@ class YouTubeDownloaderApp(QMainWindow):
             """)
 
     def create_menu_bar(self):
-        """Create the menu bar with language options"""
         menubar = self.menuBar()
         
         # File menu
@@ -637,31 +770,24 @@ class YouTubeDownloaderApp(QMainWindow):
         self.help_menu = menubar.addMenu("Help")
         self.about_action = self.help_menu.addAction("About", self.show_about)
         self.license_action = self.help_menu.addAction(self.tr("License"), self.show_license)
-        
+
     def show_license(self):
-        """Show license dialog"""
         license_dialog = LicenseDialog(self)
         license_dialog.exec_()
 
     def show_about(self):
-        """Show about dialog with proper theme"""
         about_dialog = AboutDialog(self)
-        about_dialog.apply_theme(self.dark_mode)
         about_dialog.exec_()
 
     def apply_dark_theme(self):
-        """Enable dark theme with improved colors"""
         dark_palette = QPalette()
         
-        # Basic colors
         dark_palette.setColor(QPalette.Window, QColor(45, 45, 45))
         dark_palette.setColor(QPalette.WindowText, Qt.white)
         dark_palette.setColor(QPalette.Base, QColor(30, 30, 30))
         dark_palette.setColor(QPalette.Text, Qt.white)
         dark_palette.setColor(QPalette.Button, QColor(60, 60, 60))
         dark_palette.setColor(QPalette.ButtonText, Qt.white)
-        
-        # Additional settings for better visibility
         dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
         dark_palette.setColor(QPalette.HighlightedText, Qt.white)
         dark_palette.setColor(QPalette.Link, QColor(100, 150, 240))
@@ -734,7 +860,6 @@ class YouTubeDownloaderApp(QMainWindow):
         """)
 
     def apply_light_theme(self):
-        """Enable light theme"""
         self.setPalette(QApplication.style().standardPalette())
         
         self.setStyleSheet("""
@@ -808,6 +933,9 @@ class YouTubeDownloaderApp(QMainWindow):
             self.log_output.setTextColor(Qt.black if not self.dark_mode else Qt.white)
 
     def start_download(self):
+        if self.ffmpeg_manager.install_status != "installed":
+            QMessageBox.critical(self, self.tr("Error"), self.tr("FFmpeg is not ready. Please wait or install manually."))
+            return
 
         urls = self.url_edit.toPlainText().strip().split("\n")
         urls = [url.strip() for url in urls if url.strip()]
@@ -824,7 +952,12 @@ class YouTubeDownloaderApp(QMainWindow):
                 return
 
         format_type = self.format_combo.currentData()
-        self.download_thread = DownloadThread(urls, self.download_folder, format_type)
+        self.download_thread = DownloadThread(
+            urls, 
+            self.download_folder, 
+            format_type,
+            self.ffmpeg_manager.ffmpeg_path
+        )
         self.download_thread.update_progress.connect(self.update_progress)
         self.download_thread.finished.connect(self.download_finished)
         
@@ -873,14 +1006,12 @@ class YouTubeDownloaderApp(QMainWindow):
         event.accept()
 
     def tr(self, text):
-        """Helper method for translation"""
         return QApplication.translate("YouTubeDownloaderApp", text)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     
-    # Set English as default language
     locale = QLocale("en")
     QLocale.setDefault(locale)
     
